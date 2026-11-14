@@ -1,6 +1,7 @@
-// Package proxy forwards git smart HTTP for allowed repositories to GitHub
-// with one upstream credential, after OpenBao confirms that the Requester's
-// own token holds a Grant on the repository's marker path.
+// Package proxy forwards git smart HTTP for Allowed Repositories to their
+// upstream git hosts with each repository's credential, after OpenBao
+// confirms that the Requester's own token holds a Grant on the repository's
+// Access Path.
 package proxy
 
 import (
@@ -10,13 +11,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/xtruder/openbao-git-proxy/internal/gitroute"
 	"github.com/xtruder/openbao-git-proxy/internal/openbao"
+	"github.com/xtruder/openbao-git-proxy/internal/repos"
 )
 
 // forwardedHeaders are the only request headers git needs upstream. Anything
@@ -36,36 +36,31 @@ type CapabilityChecker interface {
 	CapabilitiesSelf(ctx context.Context, token, path string) ([]string, error)
 }
 
+// RepositoryLookup finds an Allowed Repository by name. It is consulted per
+// request, so configuration refreshed from the mount applies at once.
+type RepositoryLookup interface {
+	Lookup(name string) (repos.Repository, bool)
+}
+
 // Options configures the proxy.
 type Options struct {
-	// Upstream is the scheme and host requests go to, such as https://github.com.
-	Upstream  *url.URL
-	Transport http.RoundTripper
-	OpenBao   CapabilityChecker
-	// Credential returns the current upstream token; it is read per request
-	// so a rotated token applies without a restart.
-	Credential func() string
-	// MarkerPrefix is the OpenBao path under which <owner>/<repo> is the
-	// marker path of a repository.
-	MarkerPrefix string
-	// Repositories are the lowercased owner/repo names that are forwarded.
-	Repositories []string
+	Repositories RepositoryLookup
+	Transport    http.RoundTripper
+	OpenBao      CapabilityChecker
+	// AccessPrefix is the OpenBao path under which <name> is a repository's
+	// Access Path, such as git-proxy/access.
+	AccessPrefix string
 	Logger       *slog.Logger
 }
 
 type proxy struct {
-	options      Options
-	repositories map[string]bool
-	reverse      *httputil.ReverseProxy
+	options Options
+	reverse *httputil.ReverseProxy
 }
 
 // New returns the proxy handler.
 func New(options Options) http.Handler {
-	p := &proxy{options: options, repositories: map[string]bool{}}
-	for _, repository := range options.Repositories {
-		p.repositories[repository] = true
-	}
-
+	p := &proxy{options: options}
 	p.reverse = &httputil.ReverseProxy{
 		Transport: options.Transport,
 		// Flush at once: git shows the remote's progress as it arrives.
@@ -96,11 +91,11 @@ func (p *proxy) serve(w http.ResponseWriter, r *http.Request) []slog.Attr {
 		return nil
 	}
 
-	repository := route.Repository()
-	attributes := []slog.Attr{slog.String("repository", repository), slog.String("service", string(route.Service))}
+	attributes := []slog.Attr{slog.String("repository", route.Name), slog.String("service", string(route.Service))}
 	// Unconfigured repositories are refused before any credential is asked
 	// for, so git doesn't file a Grant Request nobody could use.
-	if !p.repositories[repository] {
+	repository, ok := p.options.Repositories.Lookup(route.Name)
+	if !ok {
 		http.NotFound(w, r)
 		return attributes
 	}
@@ -111,21 +106,21 @@ func (p *proxy) serve(w http.ResponseWriter, r *http.Request) []slog.Attr {
 		return attributes
 	}
 
-	marker := p.options.MarkerPrefix + "/" + repository
+	access := p.options.AccessPrefix + "/" + route.Name
 	capability := route.Capability()
-	capabilities, err := p.options.OpenBao.CapabilitiesSelf(r.Context(), token, marker)
+	capabilities, err := p.options.OpenBao.CapabilitiesSelf(r.Context(), token, access)
 	switch {
 	case errors.Is(err, openbao.ErrInvalidToken):
 		challenge(w)
 		return attributes
 	case err != nil:
-		p.options.Logger.ErrorContext(r.Context(), "check capabilities", "repository", repository, "error", err)
+		p.options.Logger.ErrorContext(r.Context(), "check capabilities", "repository", route.Name, "error", err)
 		http.Error(w, "OpenBao is unavailable", http.StatusServiceUnavailable)
 		return attributes
-	case !slices.Contains(capabilities, capability) && !slices.Contains(capabilities, "root"):
-		item := marker + "=" + capability
+	case !allows(capabilities, capability):
+		item := access + "=" + capability
 		http.Error(w, fmt.Sprintf("%s of %s needs a Grant of %s; request it with: bao-cred request --reason TEXT --item %s",
-			route.Service, repository, item, item), http.StatusForbidden)
+			route.Service, route.Name, item, item), http.StatusForbidden)
 		return attributes
 	}
 
@@ -138,14 +133,13 @@ func (p *proxy) serve(w http.ResponseWriter, r *http.Request) []slog.Attr {
 
 	// A copy per request binds the parsed route to its rewrite.
 	reverse := *p.reverse
-	reverse.Rewrite = func(request *httputil.ProxyRequest) { p.rewrite(request, route) }
+	reverse.Rewrite = func(request *httputil.ProxyRequest) { rewrite(request, route, repository) }
 	reverse.ServeHTTP(w, r)
 	return attributes
 }
 
-func (p *proxy) rewrite(request *httputil.ProxyRequest, route gitroute.Route) {
-	path, query, _ := strings.Cut(route.UpstreamPath(), "?")
-	request.Out.URL = &url.URL{Scheme: p.options.Upstream.Scheme, Host: p.options.Upstream.Host, Path: path, RawQuery: query}
+func rewrite(request *httputil.ProxyRequest, route gitroute.Route, repository repos.Repository) {
+	request.Out.URL = route.UpstreamURL(repository.URL)
 	request.Out.Host = ""
 
 	header := http.Header{}
@@ -156,14 +150,22 @@ func (p *proxy) rewrite(request *httputil.ProxyRequest, route gitroute.Route) {
 	}
 
 	request.Out.Header = header
-	request.Out.SetBasicAuth("x-access-token", p.options.Credential())
+	request.Out.SetBasicAuth(repository.Username, repository.Password)
 }
 
-// modifyResponse keeps GitHub's cookies from clients and turns a refused
-// upstream credential or a redirect into a gateway error: passing GitHub's
-// challenge on would make git discard the Requester's valid token, and git
-// following a redirect, such as for a renamed repository, would leave the
-// proxy and its checks behind.
+// allows reports whether capabilities include capability. update, the push
+// capability, also allows fetching: every push reads the remote's refs, and
+// a Requester trusted to push can be trusted to fetch.
+func allows(capabilities []string, capability string) bool {
+	return slices.Contains(capabilities, capability) || slices.Contains(capabilities, "root") ||
+		(capability == "read" && slices.Contains(capabilities, "update"))
+}
+
+// modifyResponse keeps upstream cookies from clients and turns a refused
+// upstream credential or a redirect into a gateway error: passing the
+// host's challenge on would make git discard the Requester's valid token,
+// and git following a redirect, such as for a renamed repository, would
+// leave the proxy and its checks behind.
 func modifyResponse(response *http.Response) error {
 	switch {
 	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusProxyAuthRequired:

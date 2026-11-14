@@ -16,9 +16,19 @@ import (
 	"time"
 
 	"github.com/xtruder/openbao-git-proxy/internal/openbao"
+	"github.com/xtruder/openbao-git-proxy/internal/repos"
 )
 
 const pat = "ghp_classic-token"
+
+// fakeRepositories is the configuration the proxy would load from the
+// git-proxy mount.
+type fakeRepositories map[string]repos.Repository
+
+func (f fakeRepositories) Lookup(name string) (repos.Repository, bool) {
+	repository, ok := f[name]
+	return repository, ok
+}
 
 // fakeOpenBao answers capabilities-self from a table of token → path →
 // capabilities; tokens missing from the table are invalid.
@@ -81,9 +91,9 @@ func newHarness(t *testing.T, upstream http.Handler) *harness {
 
 	h := &harness{
 		openbao: &fakeOpenBao{capabilities: map[string]map[string][]string{
-			"reader": {"git-proxy/acmecorp/widgetshop": {"read"}},
-			"pusher": {"git-proxy/acmecorp/widgetshop": {"read", "update"}},
-			"root":   {"git-proxy/acmecorp/widgetshop": {"root"}},
+			"reader": {"git-proxy/access/widgetshop": {"read"}},
+			"pusher": {"git-proxy/access/widgetshop": {"read", "update"}, "git-proxy/access/infra": {"update"}},
+			"root":   {"git-proxy/access/widgetshop": {"root"}},
 		}},
 		logs: &bytes.Buffer{},
 	}
@@ -99,20 +109,26 @@ func newHarness(t *testing.T, upstream http.Handler) *harness {
 		})
 	}
 
-	upstreamServer := httptest.NewServer(upstream)
+	upstreamServer := httptest.NewTLSServer(upstream)
 	t.Cleanup(upstreamServer.Close)
-	upstreamURL, err := url.Parse(upstreamServer.URL)
-	if err != nil {
-		t.Fatal(err)
+	repoURL := func(path string) *url.URL {
+		parsed, err := url.Parse(upstreamServer.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return parsed
 	}
 
 	h.proxy = httptest.NewServer(New(Options{
-		Upstream:     upstreamURL,
+		Repositories: fakeRepositories{
+			"widgetshop": {URL: repoURL("/acmecorp/widgetshop.git"), Username: "x-access-token", Password: pat},
+			// Another host's layout and credential: nested groups, no .git.
+			"infra": {URL: repoURL("/ops/platform/infra"), Username: "oauth2", Password: "glpat-token"},
+		},
 		Transport:    upstreamServer.Client().Transport,
 		OpenBao:      h.openbao,
-		Credential:   func() string { return pat },
-		MarkerPrefix: "git-proxy",
-		Repositories: []string{"acmecorp/widgetshop"},
+		AccessPrefix: "git-proxy/access",
 		Logger:       slog.New(slog.NewTextHandler(h.logs, nil)),
 	}))
 	t.Cleanup(h.proxy.Close)
@@ -164,10 +180,10 @@ func (h *harness) send(t *testing.T, method, target, token string, body io.Reade
 }
 
 const (
-	fetchRefs = "/acmecorp/widgetshop.git/info/refs?service=git-upload-pack"
-	pushRefs  = "/AcmeCorp/WidgetShop/info/refs?service=git-receive-pack"
-	fetchPack = "/acmecorp/widgetshop.git/git-upload-pack"
-	pushPack  = "/acmecorp/widgetshop.git/git-receive-pack"
+	fetchRefs = "/widgetshop.git/info/refs?service=git-upload-pack"
+	pushRefs  = "/WidgetShop/info/refs?service=git-receive-pack"
+	fetchPack = "/widgetshop.git/git-upload-pack"
+	pushPack  = "/widgetshop.git/git-receive-pack"
 )
 
 func TestRefusesOtherRequestsWithoutAskingForCredentials(t *testing.T) {
@@ -175,10 +191,10 @@ func TestRefusesOtherRequestsWithoutAskingForCredentials(t *testing.T) {
 
 	h := newHarness(t, nil)
 	for _, target := range []string{
-		"/acmecorp/widgetshop.git/HEAD",
-		"/repos/acmecorp/widgetshop",
+		"/widgetshop.git/HEAD",
+		"/acmecorp/widgetshop.git/info/refs?service=git-upload-pack", // upstream paths aren't routes
 		"/graphql",
-		"/acmecorp/other.git/info/refs?service=git-upload-pack", // not configured
+		"/other.git/info/refs?service=git-upload-pack", // not configured
 	} {
 		response := h.do(t, http.MethodGet, target, "pusher", nil)
 		if response.StatusCode != http.StatusNotFound || response.Header.Get("WWW-Authenticate") != "" {
@@ -226,7 +242,7 @@ func TestRefusesRequestersWithoutAGrantOnTheMarkerPath(t *testing.T) {
 		}
 
 		// git shows a text/plain error body to the user.
-		want := "git-proxy/acmecorp/widgetshop=" + test.capability
+		want := "git-proxy/access/widgetshop=" + test.capability
 		if !strings.Contains(body, want) || !strings.HasPrefix(response.Header.Get("Content-Type"), "text/plain") {
 			t.Fatalf("403 body %q (%s) doesn't name %s", body, response.Header.Get("Content-Type"), want)
 		}
@@ -241,11 +257,13 @@ func TestForwardsGrantedRequestsWithThePATOnly(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t, nil)
-	for _, test := range []struct{ method, target, token, upstream string }{
-		{http.MethodGet, fetchRefs, "reader", "/acmecorp/widgetshop.git/info/refs?service=git-upload-pack"},
-		{http.MethodPost, fetchPack, "reader", "/acmecorp/widgetshop.git/git-upload-pack"},
-		{http.MethodGet, pushRefs, "pusher", "/acmecorp/widgetshop.git/info/refs?service=git-receive-pack"},
-		{http.MethodPost, pushPack, "root", "/acmecorp/widgetshop.git/git-receive-pack"},
+	for _, test := range []struct{ method, target, token, upstream, username, password string }{
+		{http.MethodGet, fetchRefs, "reader", "/acmecorp/widgetshop.git/info/refs?service=git-upload-pack", "x-access-token", pat},
+		{http.MethodPost, fetchPack, "reader", "/acmecorp/widgetshop.git/git-upload-pack", "x-access-token", pat},
+		{http.MethodGet, pushRefs, "pusher", "/acmecorp/widgetshop.git/info/refs?service=git-receive-pack", "x-access-token", pat},
+		{http.MethodPost, pushPack, "root", "/acmecorp/widgetshop.git/git-receive-pack", "x-access-token", pat},
+		// update alone allows fetching too.
+		{http.MethodPost, "/infra/git-upload-pack", "pusher", "/ops/platform/infra/git-upload-pack", "oauth2", "glpat-token"},
 	} {
 		response := h.do(t, test.method, test.target, test.token, strings.NewReader("0000"))
 		body := response.Body
@@ -263,7 +281,7 @@ func TestForwardsGrantedRequestsWithThePATOnly(t *testing.T) {
 		}
 
 		user, password, ok := got.BasicAuth()
-		if !ok || user != "x-access-token" || password != pat {
+		if !ok || user != test.username || password != test.password {
 			t.Fatalf("upstream Authorization = %q", got.Header.Get("Authorization"))
 		}
 
@@ -395,11 +413,11 @@ func TestLogsNoCredentials(t *testing.T) {
 	h.do(t, http.MethodGet, pushRefs, "reader", nil)
 	h.do(t, http.MethodGet, fetchRefs, "revoked", nil)
 	logs := h.logs.String()
-	if !strings.Contains(logs, "acmecorp/widgetshop") {
+	if !strings.Contains(logs, "repository=widgetshop") {
 		t.Fatalf("logs don't record the repository: %s", logs)
 	}
 
-	for _, secret := range []string{"reader", "revoked", pat, base64.StdEncoding.EncodeToString([]byte("x-bao-token:reader"))} {
+	for _, secret := range []string{"reader", "revoked", pat, "glpat-token", base64.StdEncoding.EncodeToString([]byte("x-bao-token:reader"))} {
 		if strings.Contains(logs, secret) {
 			t.Fatalf("logs contain %q: %s", secret, logs)
 		}

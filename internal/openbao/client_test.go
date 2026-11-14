@@ -59,7 +59,7 @@ func TestEveryCallUsesTheConfiguredNamespace(t *testing.T) {
 		case "/v1/sys/capabilities-self":
 			_, _ = w.Write([]byte(`{"data":{"git-proxy/a/b":["read"]}}`))
 		default:
-			_, _ = w.Write([]byte(`{"data":{"token":"ghp"}}`))
+			_, _ = w.Write([]byte(`{"data":{"url":"https://github.com/a/b.git"}}`))
 		}
 	}))
 	defer server.Close()
@@ -73,7 +73,7 @@ func TestEveryCallUsesTheConfiguredNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := client.ReadField(t.Context(), "secret/github", "token"); err != nil {
+	if _, err := client.Read(t.Context(), "git-proxy/repo/b"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -98,7 +98,7 @@ func TestCapabilitiesSelfReportsRefusedTokens(t *testing.T) {
 	}
 }
 
-func TestReadFieldUsesTheProxyToken(t *testing.T) {
+func TestReadAndListUseTheProxyToken(t *testing.T) {
 	t.Parallel()
 
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -106,28 +106,34 @@ func TestReadFieldUsesTheProxyToken(t *testing.T) {
 			t.Errorf("token %q", r.Header.Get("X-Vault-Token"))
 		}
 
-		switch r.URL.Path {
-		case "/v1/kv/data/git-proxy/github":
-			_, _ = w.Write([]byte(`{"data":{"data":{"token":"ghp_kv2"},"metadata":{"version":3}}}`))
-		case "/v1/secret/github":
-			_, _ = w.Write([]byte(`{"data":{"token":"ghp_kv1"}}`))
-		case "/v1/kv/data/empty":
-			_, _ = w.Write([]byte(`{"data":{"data":{"token":""},"metadata":{"version":1}}}`))
+		switch {
+		case r.URL.Path == "/v1/git-proxy/repo/widgetshop" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`{"data":{"url":"https://github.com/acmecorp/widgetshop.git","credential":"default"}}`))
+		case r.URL.Path == "/v1/git-proxy/repos" && r.URL.Query().Get("list") == "true":
+			_, _ = w.Write([]byte(`{"data":{"keys":["infra","widgetshop"]}}`))
 		default:
-			http.NotFound(w, r)
+			// OpenBao's answer for a path with nothing there.
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"errors":[]}`))
 		}
 	})
 
-	for path, want := range map[string]string{"kv/data/git-proxy/github": "ghp_kv2", "secret/github": "ghp_kv1"} {
-		if got, err := client.ReadField(t.Context(), path, "token"); err != nil || got != want {
-			t.Fatalf("ReadField(%s) = %q, %v; want %q", path, got, err, want)
-		}
+	data, err := client.Read(t.Context(), "git-proxy/repo/widgetshop")
+	if err != nil || data["credential"] != "default" {
+		t.Fatalf("Read = %v, %v", data, err)
 	}
 
-	for _, path := range []string{"kv/data/empty", "kv/data/missing"} {
-		if _, err := client.ReadField(t.Context(), path, "token"); err == nil {
-			t.Fatalf("ReadField(%s) succeeded", path)
-		}
+	if missing, readErr := client.Read(t.Context(), "git-proxy/repo/missing"); readErr != nil || missing != nil {
+		t.Fatalf("Read of a missing path = %v, %v; want nil, nil", missing, readErr)
+	}
+
+	names, err := client.List(t.Context(), "git-proxy/repos")
+	if err != nil || !slices.Equal(names, []string{"infra", "widgetshop"}) {
+		t.Fatalf("List = %v, %v", names, err)
+	}
+
+	if names, err := client.List(t.Context(), "git-proxy/empty"); err != nil || len(names) != 0 {
+		t.Fatalf("List of an empty path = %v, %v", names, err)
 	}
 }
 

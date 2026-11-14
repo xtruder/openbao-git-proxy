@@ -1,6 +1,6 @@
-// Command openbao-git-proxy forwards git smart HTTP for allowed repositories
-// to GitHub with one upstream credential, for Requesters whose OpenBao token
-// holds a Grant on the repository's marker path.
+// Command openbao-git-proxy forwards git smart HTTP for the repositories
+// configured in the git-proxy mount to their upstream hosts, for Requesters
+// whose OpenBao token holds a Grant on the repository's Access Path.
 package main
 
 import (
@@ -18,9 +18,9 @@ import (
 	"time"
 
 	"github.com/xtruder/openbao-git-proxy/internal/config"
-	"github.com/xtruder/openbao-git-proxy/internal/credential"
 	"github.com/xtruder/openbao-git-proxy/internal/openbao"
 	"github.com/xtruder/openbao-git-proxy/internal/proxy"
+	"github.com/xtruder/openbao-git-proxy/internal/repos"
 )
 
 // tokenRenewInterval is far below the proxy token's recommended 720h
@@ -53,30 +53,28 @@ func run(configPath string) error {
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	upstreamCredential, err := credential.Load(rootCtx, bao, cfg.CredentialPath, cfg.CredentialField)
-	if err != nil {
-		return fmt.Errorf("read the upstream credential: %w", err)
+	repositories := repos.New(bao, cfg.Mount, logger)
+	if err := repositories.Load(rootCtx); err != nil {
+		return fmt.Errorf("read the %s mount: %w", cfg.Mount, err)
 	}
 
 	go tokenRenewer(rootCtx, logger, bao)
-	go credentialRefresher(rootCtx, logger, upstreamCredential, cfg.RefreshInterval)
+	go repositoryRefresher(rootCtx, logger, repositories, cfg.RefreshInterval)
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	handler := proxy.New(proxy.Options{
-		Upstream:     cfg.Upstream,
+		Repositories: repositories,
 		Transport:    transport,
 		OpenBao:      bao,
-		Credential:   upstreamCredential.Token,
-		MarkerPrefix: cfg.MarkerPrefix,
-		Repositories: cfg.Repositories,
+		AccessPrefix: cfg.Mount + "/access",
 		Logger:       logger,
 	})
 
 	server := newHTTPServer(cfg.ListenAddress, routes(handler))
 	serveErrors := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "address", cfg.ListenAddress, "repositories", cfg.Repositories)
+		logger.Info("listening", "address", cfg.ListenAddress, "mount", cfg.Mount)
 		serveErrors <- server.ListenAndServe()
 	}()
 	select {
@@ -153,16 +151,17 @@ func tokenRenewer(ctx context.Context, logger *slog.Logger, bao *openbao.Client)
 	}
 }
 
-// credentialRefresher re-reads the upstream credential every interval after
-// the read at start, so a rotated PAT applies without a restart.
-func credentialRefresher(ctx context.Context, logger *slog.Logger, upstream *credential.Credential, interval time.Duration) {
+// repositoryRefresher reloads the repositories and credentials every
+// interval after the load at start, so changes in the mount, such as a new
+// repository or a rotated token, apply without a restart.
+func repositoryRefresher(ctx context.Context, logger *slog.Logger, repositories *repos.Repositories, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			if err := upstream.Refresh(ctx); err != nil && ctx.Err() == nil {
-				logger.Error("refresh the upstream credential; keeping the last one", "error", err)
+			if err := repositories.Load(ctx); err != nil && ctx.Err() == nil {
+				logger.Error("reload repositories; keeping the last configuration", "error", err)
 			}
 		case <-ctx.Done():
 			return

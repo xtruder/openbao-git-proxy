@@ -14,42 +14,33 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclparse"
-	"github.com/xtruder/openbao-git-proxy/internal/gitroute"
 	"github.com/zclconf/go-cty/cty"
 )
 
 const (
-	defaultUpstream        = "https://github.com"
-	defaultCredentialField = "token"
-	defaultRefreshInterval = 5 * time.Minute
-	defaultMarkerPrefix    = "git-proxy"
+	defaultMount           = "git-proxy"
+	defaultRefreshInterval = time.Minute
 )
 
-// deniedSegments are the segments of the authorizer's Hard Denylist: a
-// marker path containing one could never be granted.
+// deniedSegments are the segments of openbao-authorizer's Hard Denylist: no
+// Access Path under a mount containing one could be granted.
 var deniedSegments = []string{"sys", "auth", "identity", "cubbyhole"}
 
-// Config is the complete validated configuration.
+// Config is the complete validated configuration. Everything else, the
+// repositories and their credentials, lives in the git-proxy mount.
 type Config struct {
 	ListenAddress    string
 	OpenBaoAddress   string
 	OpenBaoNamespace string
 	OpenBaoCAFile    string
 	OpenBaoToken     string
-	Upstream         *url.URL
-	CredentialPath   string
-	CredentialField  string
+	Mount            string
 	RefreshInterval  time.Duration
-	MarkerPrefix     string
-	// Repositories are lowercased owner/repo names without .git.
-	Repositories []string
 }
 
 type fileConfig struct {
-	Server   serverConfig   `hcl:"server,block"`
-	OpenBao  openBaoConfig  `hcl:"openbao,block"`
-	Upstream upstreamConfig `hcl:"upstream,block"`
-	Access   accessConfig   `hcl:"access,block"`
+	Server  serverConfig  `hcl:"server,block"`
+	OpenBao openBaoConfig `hcl:"openbao,block"`
 }
 
 type serverConfig struct {
@@ -57,22 +48,12 @@ type serverConfig struct {
 }
 
 type openBaoConfig struct {
-	Address   string `hcl:"address"`
-	Namespace string `hcl:"namespace,optional"`
-	CAFile    string `hcl:"ca_file,optional"`
-	TokenFile string `hcl:"token_file"`
-}
-
-type upstreamConfig struct {
-	URL             string `hcl:"url,optional"`
-	CredentialPath  string `hcl:"credential_path"`
-	CredentialField string `hcl:"credential_field,optional"`
+	Address         string `hcl:"address"`
+	Namespace       string `hcl:"namespace,optional"`
+	CAFile          string `hcl:"ca_file,optional"`
+	TokenFile       string `hcl:"token_file"`
+	Mount           string `hcl:"mount,optional"`
 	RefreshInterval string `hcl:"refresh_interval,optional"`
-}
-
-type accessConfig struct {
-	MarkerPrefix string   `hcl:"marker_prefix,optional"`
-	Repositories []string `hcl:"repositories"`
 }
 
 // Load reads one HCL configuration and the token file it references.
@@ -110,9 +91,8 @@ func Load(path string) (Config, error) {
 		OpenBaoAddress:   strings.TrimSpace(raw.OpenBao.Address),
 		OpenBaoNamespace: raw.OpenBao.Namespace,
 		OpenBaoCAFile:    resolvePath(raw.OpenBao.CAFile),
-		CredentialPath:   strings.Trim(raw.Upstream.CredentialPath, "/"),
-		CredentialField:  orDefault(raw.Upstream.CredentialField, defaultCredentialField),
-		MarkerPrefix:     strings.Trim(orDefault(raw.Access.MarkerPrefix, defaultMarkerPrefix), "/"),
+		Mount:            strings.Trim(orDefault(raw.OpenBao.Mount, defaultMount), "/"),
+		RefreshInterval:  defaultRefreshInterval,
 	}
 
 	if cfg.ListenAddress == "" {
@@ -127,83 +107,31 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 
-	if cfg.Upstream, err = parseUpstream(orDefault(raw.Upstream.URL, defaultUpstream)); err != nil {
-		return Config{}, err
-	}
-
-	if cfg.CredentialPath == "" {
-		return Config{}, errors.New("upstream.credential_path is required")
-	}
-
-	cfg.RefreshInterval = defaultRefreshInterval
-	if raw.Upstream.RefreshInterval != "" {
-		cfg.RefreshInterval, err = time.ParseDuration(raw.Upstream.RefreshInterval)
+	if raw.OpenBao.RefreshInterval != "" {
+		cfg.RefreshInterval, err = time.ParseDuration(raw.OpenBao.RefreshInterval)
 		if err != nil || cfg.RefreshInterval <= 0 {
-			return Config{}, errors.New("upstream.refresh_interval must be a positive duration such as 5m")
+			return Config{}, errors.New("openbao.refresh_interval must be a positive duration such as 1m")
 		}
 	}
 
-	if err = validateMarkerPrefix(cfg.MarkerPrefix); err != nil {
-		return Config{}, err
-	}
-
-	if cfg.Repositories, err = parseRepositories(raw.Access.Repositories); err != nil {
+	if err = validateMount(cfg.Mount); err != nil {
 		return Config{}, err
 	}
 
 	return cfg, nil
 }
 
-// parseUpstream accepts only a scheme and host: the proxy builds every path.
-func parseUpstream(value string) (*url.URL, error) {
-	upstream, err := url.Parse(value)
-	if err != nil || (upstream.Scheme != "http" && upstream.Scheme != "https") || upstream.Host == "" ||
-		strings.Trim(upstream.Path, "/") != "" || upstream.RawQuery != "" || upstream.User != nil {
-		return nil, errors.New("upstream.url must be a scheme and host only, such as https://github.com")
-	}
-
-	return &url.URL{Scheme: upstream.Scheme, Host: upstream.Host}, nil
-}
-
-// validateMarkerPrefix requires a concrete path that the authorizer's Hard
-// Denylist doesn't refuse, or no marker path under it could be granted.
-func validateMarkerPrefix(prefix string) error {
-	for segment := range strings.SplitSeq(prefix, "/") {
+// validateMount requires a concrete path that the authorizer's Hard
+// Denylist doesn't refuse, or no Access Path under it could be granted.
+func validateMount(mount string) error {
+	for segment := range strings.SplitSeq(mount, "/") {
 		if segment == "" || segment == "." || segment == ".." || strings.ContainsAny(segment, "*+") ||
 			slices.Contains(deniedSegments, strings.ToLower(segment)) {
-			return fmt.Errorf("access.marker_prefix %q must be a concrete OpenBao path without a sys, auth, identity or cubbyhole segment", prefix)
+			return fmt.Errorf("openbao.mount %q must be a concrete OpenBao path without a sys, auth, identity or cubbyhole segment", mount)
 		}
 	}
 
 	return nil
-}
-
-func parseRepositories(values []string) ([]string, error) {
-	if len(values) == 0 {
-		return nil, errors.New("access.repositories must list at least one owner/repo")
-	}
-
-	repositories := make([]string, 0, len(values))
-	for _, value := range values {
-		owner, repo, ok := strings.Cut(strings.ToLower(value), "/")
-		repo = strings.TrimSuffix(repo, ".git")
-		if !ok || !gitroute.ValidName(owner) || !gitroute.ValidName(repo) {
-			return nil, fmt.Errorf("access.repositories: %q is not owner/repo", value)
-		}
-
-		if slices.Contains(deniedSegments, owner) || slices.Contains(deniedSegments, repo) {
-			return nil, fmt.Errorf("access.repositories: %q can't be granted: the authorizer refuses paths with a %s segment", value, strings.Join(deniedSegments, ", "))
-		}
-
-		repository := owner + "/" + repo
-		if slices.Contains(repositories, repository) {
-			return nil, fmt.Errorf("access.repositories: duplicate %q", value)
-		}
-
-		repositories = append(repositories, repository)
-	}
-
-	return repositories, nil
 }
 
 func orDefault(value, fallback string) string {

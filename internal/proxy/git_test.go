@@ -66,7 +66,7 @@ func TestRealGitFetchesAndPushesThroughTheProxy(t *testing.T) {
 	}
 
 	remote := func(token string) string {
-		return strings.Replace(h.proxy.URL, "http://", "http://x-bao-token:"+token+"@", 1) + "/AcmeCorp/WidgetShop.git"
+		return strings.Replace(h.proxy.URL, "http://", "http://x-bao-token:"+token+"@", 1) + "/WidgetShop.git"
 	}
 
 	work := t.TempDir()
@@ -88,7 +88,7 @@ func TestRealGitFetchesAndPushesThroughTheProxy(t *testing.T) {
 	}
 
 	output, err := git(t, filepath.Join(work, "second"), "push", remote("reader"), "HEAD:other")
-	if err == nil || !strings.Contains(output, "git-proxy/acmecorp/widgetshop=update") {
+	if err == nil || !strings.Contains(output, "git-proxy/access/widgetshop=update") {
 		t.Fatalf("push as reader: %v, want refused naming the Grant\n%s", err, output)
 	}
 

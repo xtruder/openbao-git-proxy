@@ -23,12 +23,10 @@ const (
 // one repository.
 var ErrNotGitRoute = errors.New("not a git smart HTTP request")
 
-// Route is one git smart HTTP request for a repository. Owner and Repo are
-// lowercased and Repo has no .git suffix, because GitHub treats names case
-// insensitively and one repository must map to one marker path.
+// Route is one git smart HTTP request for a repository, addressed by its
+// lowercased Repository Name.
 type Route struct {
-	Owner   string
-	Repo    string
+	Name    string
 	Service Service
 	// Advertisement is the GET info/refs request that starts every fetch and
 	// push; otherwise the route is the POST that carries the pack.
@@ -37,30 +35,30 @@ type Route struct {
 
 // Parse accepts only these requests, with or without .git:
 //
-//	GET  /<owner>/<repo>.git/info/refs?service=git-upload-pack|git-receive-pack
-//	POST /<owner>/<repo>.git/git-upload-pack
-//	POST /<owner>/<repo>.git/git-receive-pack
+//	GET  /<name>.git/info/refs?service=git-upload-pack|git-receive-pack
+//	POST /<name>.git/git-upload-pack
+//	POST /<name>.git/git-receive-pack
 //
+// The repository is named, never addressed by its upstream path, so the
+// request has one segment to validate whatever the host's path layout.
 // Dumb HTTP, other services, other query parameters and any escaped
-// character in the path are refused, so nothing reaches upstream that the
-// allow-list didn't see in plain form.
+// character in the path are refused.
 func Parse(method string, target *url.URL) (Route, error) {
 	if target.RawPath != "" || target.Opaque != "" {
 		return Route{}, ErrNotGitRoute
 	}
 
 	segments := strings.Split(target.Path, "/")
-	if len(segments) < 4 || segments[0] != "" {
+	if len(segments) < 3 || segments[0] != "" {
 		return Route{}, ErrNotGitRoute
 	}
 
-	owner, repo := strings.ToLower(segments[1]), strings.ToLower(strings.TrimSuffix(segments[2], ".git"))
-	if !ValidName(owner) || !ValidName(repo) {
+	route := Route{Name: strings.ToLower(strings.TrimSuffix(segments[1], ".git"))}
+	if !ValidRepositoryName(route.Name) {
 		return Route{}, ErrNotGitRoute
 	}
 
-	route := Route{Owner: owner, Repo: repo}
-	rest := segments[3:]
+	rest := segments[2:]
 	switch {
 	case method == http.MethodGet && len(rest) == 2 && rest[0] == "info" && rest[1] == "refs":
 		query, err := url.ParseQuery(target.RawQuery)
@@ -83,12 +81,7 @@ func Parse(method string, target *url.URL) (Route, error) {
 	return route, nil
 }
 
-// Repository is the route's lowercased owner/repo.
-func (r Route) Repository() string {
-	return r.Owner + "/" + r.Repo
-}
-
-// Capability is what a Requester needs on the repository's Marker Path:
+// Capability is what a Requester needs on the repository's Access Path:
 // update to push, read to fetch.
 func (r Route) Capability() string {
 	if r.Service == ReceivePack {
@@ -98,20 +91,19 @@ func (r Route) Capability() string {
 	return "read"
 }
 
-// UpstreamPath is the canonical path and query of the route on GitHub.
-func (r Route) UpstreamPath() string {
-	base := "/" + r.Owner + "/" + r.Repo + ".git/"
+// UpstreamURL appends the route to the repository's configured clone URL.
+func (r Route) UpstreamURL(clone *url.URL) *url.URL {
+	upstream := *clone
+	upstream.Path = strings.TrimSuffix(clone.Path, "/")
+	upstream.RawPath = ""
+	upstream.RawQuery = ""
+	upstream.Fragment = ""
 	if r.Advertisement {
-		return base + "info/refs?service=" + string(r.Service)
+		upstream.Path += "/info/refs"
+		upstream.RawQuery = "service=" + string(r.Service)
+	} else {
+		upstream.Path += "/" + string(r.Service)
 	}
 
-	return base + string(r.Service)
-}
-
-// ValidName reports whether value is a lowercased owner or repository name.
-// It allows the characters GitHub allows in owner and repository
-// names, which also keeps them safe as OpenBao path segments.
-func ValidName(value string) bool {
-	return value != "" && value != "." && value != ".." &&
-		strings.Trim(value, "abcdefghijklmnopqrstuvwxyz0123456789-_.") == ""
+	return &upstream
 }

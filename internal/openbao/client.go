@@ -20,7 +20,7 @@ type Config struct {
 	Address   string
 	Namespace string
 	CAFile    string
-	// Token is the proxy's own credential. It reads the upstream credential;
+	// Token is the proxy's own credential. It reads the git-proxy mount;
 	// Requester tokens are used only for capabilities-self.
 	Token string
 }
@@ -95,29 +95,42 @@ func (c *Client) CapabilitiesSelf(ctx context.Context, token, path string) ([]st
 	return capabilities, nil
 }
 
-// ReadField reads one non-empty string field at path with the proxy's
-// token. A KV v2 response's inner data object is unwrapped.
-func (c *Client) ReadField(ctx context.Context, path, field string) (string, error) {
+// Read returns the data at path, read with the proxy's token, or nil for
+// a path with nothing there.
+func (c *Client) Read(ctx context.Context, path string) (map[string]any, error) {
 	secret, err := c.api.Logical().ReadWithContext(ctx, path)
 	if err != nil {
-		return "", fmt.Errorf("read %q: %w", path, err)
+		return nil, fmt.Errorf("read %q: %w", path, err)
 	}
 
-	if secret == nil || secret.Data == nil {
-		return "", fmt.Errorf("read %q: no secret", path)
+	if secret == nil {
+		return nil, nil
 	}
 
-	data := secret.Data
-	if inner, ok := data["data"].(map[string]any); ok && data["metadata"] != nil {
-		data = inner
+	return secret.Data, nil
+}
+
+// List returns the keys under path, read with the proxy's token; an empty
+// or missing path has none.
+func (c *Client) List(ctx context.Context, path string) ([]string, error) {
+	secret, err := c.api.Logical().ListWithContext(ctx, path)
+	if err != nil {
+		return nil, fmt.Errorf("list %q: %w", path, err)
 	}
 
-	value, ok := data[field].(string)
-	if !ok || value == "" {
-		return "", fmt.Errorf("read %q: field %q is missing or empty", path, field)
+	if secret == nil {
+		return nil, nil
 	}
 
-	return value, nil
+	raw, _ := secret.Data["keys"].([]any)
+	keys := make([]string, 0, len(raw))
+	for _, value := range raw {
+		if key, ok := value.(string); ok {
+			keys = append(keys, key)
+		}
+	}
+
+	return keys, nil
 }
 
 // RenewSelf renews the proxy's own token and returns its new TTL. A
