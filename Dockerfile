@@ -11,7 +11,7 @@ RUN test -n "${TARGETARCH}" && \
     CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
 	go build -trimpath -ldflags='-s -w' -o /out/openbao-git-proxy ./cmd/openbao-git-proxy
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S -g 65532 proxy && \
     adduser -S -D -H -u 65532 -G proxy proxy
