@@ -1,0 +1,60 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errcheck
+    - errorlint
+    - exhaustive
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - modernize
+    - nilerr
+    - noctx
+    - prealloc
+    - revive
+    - staticcheck
+    - thelper
+    - tparallel
+    - unconvert
+    - unused
+    - usetesting
+    - usestdlibvars
+    - wsl_v5
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    gosec:
+      excludes:
+        - G404
+    usetesting:
+      context-background: true
+      context-todo: true
+      os-temp-dir: true
+    wsl_v5:
+      default: none
+      enable:
+        - after-block
+        - leading-whitespace
+        - trailing-whitespace
+  exclusions:
+    generated: lax
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - dupl
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

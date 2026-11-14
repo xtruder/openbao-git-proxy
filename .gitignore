@@ -1,0 +1,12 @@
+# Binaries
+/bin/
+/openbao-git-proxy
+
+# Runtime state
+.env
+*.log
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
